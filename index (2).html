@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gestion des pauses</title>
+<style>
+  :root{
+    --bg:#111417; --panel:#1b1f24; --border:#2c323a; --text:#e8e8e8;
+    --muted:#9aa4af; --accent:#3b82f6; --warn:#f59e0b; --danger:#ef4444; --ok:#22c55e;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Arial,sans-serif;padding:16px;}
+  h1{font-size:1.2rem;margin:0 0 12px;}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px;}
+  label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px;}
+  select,input,button{font-size:1rem;padding:8px;border-radius:6px;border:1px solid var(--border);background:#0e1114;color:var(--text);}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;}
+  .row > div{flex:1;min-width:120px;}
+  button.primary{background:var(--accent);border:none;color:#fff;cursor:pointer;font-weight:600;}
+  button.primary:hover{opacity:.9;}
+  button.small{padding:4px 8px;font-size:.8rem;cursor:pointer;background:#2a2f36;color:var(--text);border:1px solid var(--border);}
+  .zones{display:flex;gap:14px;flex-wrap:wrap;}
+  .zone{flex:1;min-width:260px;}
+  .zone h2{font-size:1rem;margin:0 0 8px;color:var(--muted);}
+  table{width:100%;border-collapse:collapse;font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--border);padding:6px 4px;text-align:left;}
+  tr.conflict{background:rgba(245,158,11,.15);}
+  #warning{display:none;background:rgba(245,158,11,.12);border:1px solid var(--warn);border-radius:6px;padding:10px;margin-bottom:10px;font-size:.9rem;}
+  #warning button{margin-right:8px;margin-top:8px;}
+  #status{font-size:.8rem;color:var(--muted);margin-top:6px;}
+  #status.err{color:var(--danger);}
+  .machines-pick{display:flex;gap:14px;flex-wrap:wrap;}
+  .machines-pick fieldset{border:1px solid var(--border);border-radius:6px;padding:8px 10px;}
+  .machines-pick legend{color:var(--muted);font-size:.8rem;padding:0 4px;}
+  .machines-pick label{display:inline-flex;align-items:center;gap:4px;margin-right:10px;color:var(--text);font-size:.9rem;}
+  .machines-pick input[type=checkbox]{width:auto;padding:0;}
+</style>
+</head>
+<body>
+
+<h1>Gestion des pauses — atelier</h1>
+
+<div class="panel">
+  <div class="row">
+    <div style="flex:2;min-width:280px;">
+      <label>Machine(s) dont tu es responsable (même zone)</label>
+      <div class="machines-pick">
+        <fieldset><legend>Zone 1</legend><div id="picksZone1"></div></fieldset>
+        <fieldset><legend>Zone 2</legend><div id="picksZone2"></div></fieldset>
+      </div>
+    </div>
+    <div>
+      <label>Heure de début</label>
+      <input type="time" id="heure">
+    </div>
+    <div>
+      <label>Durée</label>
+      <select id="duree">
+        <option value="30">30 min</option>
+        <option value="45">45 min</option>
+      </select>
+    </div>
+    <div>
+      <label>Nom (optionnel)</label>
+      <input type="text" id="nom" placeholder="ex: Julien">
+    </div>
+  </div>
+  <div id="warning"></div>
+  <button class="primary" id="btnReserver">Réserver la pause</button>
+  <div id="status"></div>
+</div>
+
+<div class="zones">
+  <div class="zone">
+    <h2>Zone 1</h2>
+    <table id="tableZone1"><thead><tr><th>Machine</th><th>Heure</th><th>Durée</th><th>Nom</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="zone">
+    <h2>Zone 2</h2>
+    <table id="tableZone2"><thead><tr><th>Machine</th><th>Heure</th><th>Durée</th><th>Nom</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<script>
+/* ===================== CONFIG A REMPLIR ===================== */
+const GH_OWNER  = "TON-PSEUDO-GITHUB";
+const GH_REPO   = "gestion-pauses";
+const GH_PATH   = "data/pauses.json";
+const GH_BRANCH = "main";
+const GH_TOKEN  = "COLLE_TON_TOKEN_ICI";
+const BACKGROUND_IMAGE_URL = ""; // <- colle ici le lien de ton image de fond
+/* =============================================================
+   Le fichier data/pauses.json doit exister dans le repo avec le
+   contenu initial: {}
+   Le token doit avoir le scope "Contents: Read and write" sur ce repo.
+   Il est le même pour tout le monde (embarqué dans cette page).
+
+   Seuil de surcharge : si plus de 4 machines d'une même zone se
+   retrouvent en pause en même temps (chevauchement d'horaires),
+   un avertissement s'affiche (mais on peut valider quand même).
+================================================================ */
+const SEUIL_SURCHARGE = 4;
+
+const ZONES = {
+  1: ["S2","S19","S13","S15","S16","S8","S17","S14"],
+  2: ["S5","S6","S10","S9","S12","S7","S1"]
+};
+
+let currentSha = null;
+let currentData = {};
+
+function todayKey(){
+  const d = new Date();
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+}
+
+function toMinutes(hhmm){
+  const [h,m] = hhmm.split(":").map(Number);
+  return h*60+m;
+}
+
+function overlap(startA, durA, startB, durB){
+  const a1=toMinutes(startA), a2=a1+durA;
+  const b1=toMinutes(startB), b2=b1+durB;
+  return a1 < b2 && b1 < a2;
+}
+
+function zoneOfMachine(machine){
+  if (ZONES[1].includes(machine)) return 1;
+  if (ZONES[2].includes(machine)) return 2;
+  return null;
+}
+
+function fillMachineCheckboxes(){
+  [1,2].forEach(z=>{
+    const container = document.getElementById("picksZone"+z);
+    container.innerHTML = "";
+    ZONES[z].forEach(m=>{
+      const lbl = document.createElement("label");
+      lbl.innerHTML = `<input type="checkbox" value="${m}" data-zone="${z}"> ${m}`;
+      container.appendChild(lbl);
+    });
+  });
+}
+fillMachineCheckboxes();
+
+if (BACKGROUND_IMAGE_URL){
+  document.body.style.backgroundImage = `linear-gradient(rgba(17,20,23,.85), rgba(17,20,23,.85)), url("${BACKGROUND_IMAGE_URL}")`;
+  document.body.style.backgroundSize = "cover";
+  document.body.style.backgroundPosition = "center";
+  document.body.style.backgroundAttachment = "fixed";
+}
+
+function getSelectedMachines(){
+  return Array.from(document.querySelectorAll(".machines-pick input[type=checkbox]:checked")).map(c=>c.value);
+}
+
+function setStatus(msg, isErr){
+  const s = document.getElementById("status");
+  s.textContent = msg || "";
+  s.className = isErr ? "err" : "";
+}
+
+async function loadData(){
+  setStatus("Chargement…");
+  try{
+    const url = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}?ref=${GH_BRANCH}`;
+    const res = await fetch(url, { headers: { Authorization: `token ${GH_TOKEN}` } });
+    if (!res.ok) throw new Error("Erreur GitHub: "+res.status);
+    const json = await res.json();
+    currentSha = json.sha;
+    const content = decodeURIComponent(escape(atob(json.content.replace(/\n/g,""))));
+    currentData = JSON.parse(content || "{}");
+    render();
+    setStatus("");
+  }catch(e){
+    setStatus("Erreur de chargement: "+e.message, true);
+  }
+}
+
+async function saveData(){
+  const body = {
+    message: "Mise à jour pauses "+new Date().toISOString(),
+    content: btoa(unescape(encodeURIComponent(JSON.stringify(currentData, null, 2)))),
+    sha: currentSha,
+    branch: GH_BRANCH
+  };
+  const url = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: `token ${GH_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (res.status === 409){
+    await loadData();
+    body.sha = currentSha;
+    const retry = await fetch(url, {
+      method:"PUT",
+      headers:{ Authorization:`token ${GH_TOKEN}`, "Content-Type":"application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!retry.ok) throw new Error("Conflit d'écriture, réessaie");
+    const j = await retry.json();
+    currentSha = j.content.sha;
+    return;
+  }
+  if (!res.ok) throw new Error("Erreur d'enregistrement: "+res.status);
+  const j = await res.json();
+  currentSha = j.content.sha;
+}
+
+// Renvoie les machines (d'une zone donnée) déjà en pause à un horaire donné,
+// en excluant éventuellement une réservation précise (pour l'edition/suppression).
+function machinesEnPauseDansZone(zone, start, duree, excludeId){
+  const key = todayKey();
+  const list = currentData[key] || [];
+  const set = new Set();
+  list.forEach(r=>{
+    if (r.id === excludeId) return;
+    if (overlap(r.start, r.duree, start, duree)){
+      r.machines.forEach(m=>{ if (zoneOfMachine(m) === zone) set.add(m); });
+    }
+  });
+  return set;
+}
+
+function render(){
+  const key = todayKey();
+  const list = currentData[key] || [];
+
+  [1,2].forEach(z=>{
+    const tbody = document.querySelector("#tableZone"+z+" tbody");
+    tbody.innerHTML = "";
+    // construit les lignes machine par machine, dans l'ordre de la zone
+    const rows = [];
+    list.forEach(r=>{
+      r.machines.forEach(m=>{
+        if (zoneOfMachine(m) === z) rows.push({m, r});
+      });
+    });
+    rows.sort((a,b)=> ZONES[z].indexOf(a.m)-ZONES[z].indexOf(b.m) || toMinutes(a.r.start)-toMinutes(b.r.start));
+    rows.forEach(({m,r})=>{
+      const enPause = machinesEnPauseDansZone(z, r.start, r.duree, null);
+      const conf = enPause.size > SEUIL_SURCHARGE;
+      const tr = document.createElement("tr");
+      if (conf) tr.className = "conflict";
+      tr.innerHTML = `<td>${m}</td><td>${r.start}</td><td>${r.duree} min</td><td>${r.nom||""}</td>
+        <td><button class="small" onclick="supprimer('${r.id}')">✕</button></td>`;
+      tbody.appendChild(tr);
+    });
+  });
+}
+
+async function supprimer(id){
+  const key = todayKey();
+  currentData[key] = (currentData[key]||[]).filter(r=>r.id!==id);
+  try{
+    await saveData();
+    render();
+  }catch(e){
+    setStatus("Erreur: "+e.message, true);
+  }
+}
+
+function showWarning(zone, machinesConcernees){
+  const box = document.getElementById("warning");
+  box.innerHTML = `⚠️ Situation non optimale : ${machinesConcernees.size} machines de la Zone ${zone} seraient en pause en même temps (${Array.from(machinesConcernees).join(", ")}). Plus de ${SEUIL_SURCHARGE}, ça risque d'être trop pour ceux qui restent.<br>
+    <button class="small" id="btnConfirmerQuandMeme">Valider quand même</button>
+    <button class="small" id="btnAnnulerPause">Annuler</button>`;
+  box.style.display = "block";
+  return new Promise(resolve=>{
+    document.getElementById("btnConfirmerQuandMeme").onclick = ()=>{ box.style.display="none"; resolve(true); };
+    document.getElementById("btnAnnulerPause").onclick = ()=>{ box.style.display="none"; resolve(false); };
+  });
+}
+
+document.getElementById("btnReserver").addEventListener("click", async ()=>{
+  const machines = getSelectedMachines();
+  const start = document.getElementById("heure").value;
+  const duree = parseInt(document.getElementById("duree").value, 10);
+  const nom = document.getElementById("nom").value.trim();
+
+  if (machines.length === 0){ setStatus("Sélectionne au moins une machine.", true); return; }
+  if (!start){ setStatus("Choisis une heure.", true); return; }
+
+  const zones = new Set(machines.map(zoneOfMachine));
+  if (zones.size > 1){ setStatus("Les machines sélectionnées doivent être dans la même zone.", true); return; }
+  const zone = [...zones][0];
+
+  const dejaEnPause = machinesEnPauseDansZone(zone, start, duree, null);
+  const total = new Set([...dejaEnPause, ...machines]);
+  if (total.size > SEUIL_SURCHARGE){
+    const go = await showWarning(zone, total);
+    if (!go) return;
+  }
+
+  const key = todayKey();
+  if (!currentData[key]) currentData[key] = [];
+  currentData[key].push({ id: Date.now()+"-"+Math.random().toString(36).slice(2,7), machines, start, duree, nom });
+
+  setStatus("Enregistrement…");
+  try{
+    await saveData();
+    render();
+    setStatus("Pause enregistrée.");
+    document.getElementById("nom").value = "";
+    document.querySelectorAll(".machines-pick input[type=checkbox]:checked").forEach(c=>c.checked=false);
+  }catch(e){
+    setStatus("Erreur: "+e.message, true);
+  }
+});
+
+loadData();
+setInterval(loadData, 20000);
+</script>
+</body>
+</html>
